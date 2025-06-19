@@ -1,0 +1,80 @@
+name: Build and Deploy to ECR
+
+on:
+  push:
+    branches:
+      - master
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    env:
+      AWS_REGION: ${{ secrets.AWS_REGION }}
+      ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
+      DEPLOYMENT_REPO: ${{ secrets.DEPLOYMENT_REPO }}
+      DEPLOYMENT_REPO_SSH: ${{ secrets.DEPLOYMENT_REPO_SSH }}
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v3
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Extract short SHA
+        id: vars
+        run: echo "SHORT_SHA=$(echo $GITHUB_SHA | cut -c1-7)" >> $GITHUB_ENV
+
+      - name: Build and push vote image
+        run: |
+          docker build -t $ECR_REPOSITORY/vote:$SHORT_SHA ./vote
+          docker tag $ECR_REPOSITORY/vote:$SHORT_SHA ${{ steps.login-ecr.outputs.registry }}/$ECR_REPOSITORY/vote:$SHORT_SHA
+          docker push ${{ steps.login-ecr.outputs.registry }}/$ECR_REPOSITORY/vote:$SHORT_SHA
+
+      - name: Build and push result image
+        run: |
+          docker build -t $ECR_REPOSITORY/result:$SHORT_SHA ./result
+          docker tag $ECR_REPOSITORY/result:$SHORT_SHA ${{ steps.login-ecr.outputs.registry }}/$ECR_REPOSITORY/result:$SHORT_SHA
+          docker push ${{ steps.login-ecr.outputs.registry }}/$ECR_REPOSITORY/result:$SHORT_SHA
+
+      - name: Build and push worker image
+        run: |
+          docker build -t $ECR_REPOSITORY/worker:$SHORT_SHA ./worker
+          docker tag $ECR_REPOSITORY/worker:$SHORT_SHA ${{ steps.login-ecr.outputs.registry }}/$ECR_REPOSITORY/worker:$SHORT_SHA
+          docker push ${{ steps.login-ecr.outputs.registry }}/$ECR_REPOSITORY/worker:$SHORT_SHA
+
+      - name: Build and push seed-data image
+        run: |
+          docker build -t $ECR_REPOSITORY/seed-data:$SHORT_SHA ./seed-data
+          docker tag $ECR_REPOSITORY/seed-data:$SHORT_SHA ${{ steps.login-ecr.outputs.registry }}/$ECR_REPOSITORY/seed-data:$SHORT_SHA
+          docker push ${{ steps.login-ecr.outputs.registry }}/$ECR_REPOSITORY/seed-data:$SHORT_SHA
+
+      - name: Checkout deployment repo
+        uses: actions/checkout@v3
+        with:
+          repository: ${{ env.DEPLOYMENT_REPO }}
+          ssh-key: ${{ secrets.DEPLOYMENT_REPO_SSH }}
+          path: deployment-repo
+
+      - name: Update deployment YAMLs with new image tags
+        run: |
+          find deployment-repo -type f -name '*.yaml' -exec sed -i "s|image: .*/vote:.*|image: ${{ steps.login-ecr.outputs.registry }}/$ECR_REPOSITORY/vote:$SHORT_SHA|g" {} +
+          find deployment-repo -type f -name '*.yaml' -exec sed -i "s|image: .*/result:.*|image: ${{ steps.login-ecr.outputs.registry }}/$ECR_REPOSITORY/result:$SHORT_SHA|g" {} +
+          find deployment-repo -type f -name '*.yaml' -exec sed -i "s|image: .*/worker:.*|image: ${{ steps.login-ecr.outputs.registry }}/$ECR_REPOSITORY/worker:$SHORT_SHA|g" {} +
+          find deployment-repo -type f -name '*.yaml' -exec sed -i "s|image: .*/seed-data:.*|image: ${{ steps.login-ecr.outputs.registry }}/$ECR_REPOSITORY/seed-data:$SHORT_SHA|g" {} +
+
+      - name: Commit and push changes to deployment repo
+        run: |
+          cd deployment-repo
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add .
+          git commit -m "Update image tags to $SHORT_SHA [ci skip]" || echo "No changes to commit"
+          git push 
