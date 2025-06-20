@@ -58,7 +58,7 @@ jobs:
           docker tag $ECR_REPOSITORY/seed-data:$SHORT_SHA ${{ steps.login-ecr.outputs.registry }}/$ECR_REPOSITORY/seed-data:$SHORT_SHA
           docker push ${{ steps.login-ecr.outputs.registry }}/$ECR_REPOSITORY/seed-data:$SHORT_SHA
 
-      # Cleanup old ECR images
+      # Cleanup old ECR images safely
       - name: Cleanup old ECR images
         run: |
           IMAGE_CATEGORIES=("vote" "result" "worker" "seed-data")
@@ -67,25 +67,39 @@ jobs:
           for REPO_NAME in "${IMAGE_CATEGORIES[@]}"; do
             echo "Cleaning up $ECR_REPOSITORY/$REPO_NAME"
 
-            # Delete untagged images
-            echo "Deleting untagged images..."
-            aws ecr batch-delete-image \
+            # Delete untagged images safely
+            echo "Checking for untagged images..."
+            UNTAGGED_IMAGES=$(aws ecr list-images \
               --repository-name "$ECR_REPOSITORY/$REPO_NAME" \
-              --image-ids "$(aws ecr list-images --repository-name "$ECR_REPOSITORY/$REPO_NAME" --filter "tagStatus=UNTAGGED" --query 'imageIds[*]' --output json)" || true
+              --filter "tagStatus=UNTAGGED" \
+              --query 'imageIds[*]' \
+              --output json)
 
-            # Delete images older than the defined threshold
-            echo "Deleting images older than $DAYS_TO_KEEP days..."
-            aws ecr describe-images \
-              --repository-name "$ECR_REPOSITORY/$REPO_NAME" \
-              --query "sort_by(imageDetails, &imagePushedAt)[*].imageDigest" \
-              --output text | while read digest; do
-
-              PUSH_DATE=$(aws ecr describe-images \
+            if [[ "$UNTAGGED_IMAGES" != "[]" ]]; then
+              echo "Deleting untagged images..."
+              aws ecr batch-delete-image \
                 --repository-name "$ECR_REPOSITORY/$REPO_NAME" \
-                --image-ids imageDigest="$digest" \
-                --query 'imageDetails[0].imagePushedAt' --output text)
+                --image-ids "$UNTAGGED_IMAGES" || true
+            else
+              echo "No untagged images to delete."
+            fi
 
-              PUSH_TIMESTAMP=$(date -d "$PUSH_DATE" +%s)
+            # Delete old images
+            echo "Checking for images older than $DAYS_TO_KEEP days..."
+            IMAGE_DETAILS=$(aws ecr describe-images \
+              --repository-name "$ECR_REPOSITORY/$REPO_NAME" \
+              --query "imageDetails[*].[imageDigest,imagePushedAt]" \
+              --output json)
+
+            echo "$IMAGE_DETAILS" | jq -c '.[]' | while read -r image; do
+              digest=$(echo "$image" | jq -r '.[0]')
+              pushedAt=$(echo "$image" | jq -r '.[1]')
+
+              if [[ "$pushedAt" == "null" || -z "$digest" ]]; then
+                continue
+              fi
+
+              PUSH_TIMESTAMP=$(date -d "$pushedAt" +%s)
               CURRENT_TIMESTAMP=$(date +%s)
               DAYS_OLD=$(((CURRENT_TIMESTAMP - PUSH_TIMESTAMP) / 86400))
 
