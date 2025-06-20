@@ -1,5 +1,5 @@
 name: Build and Deploy to ECR
-#12
+
 on:
   push:
     branches:
@@ -13,6 +13,7 @@ jobs:
       ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
       DEPLOYMENT_REPO: ${{ secrets.DEPLOYMENT_REPO }}
       DEPLOYMENT_REPO_SSH: ${{ secrets.DEPLOYMENT_REPO_SSH }}
+
     steps:
       - name: Checkout source code
         uses: actions/checkout@v3
@@ -32,6 +33,7 @@ jobs:
         id: vars
         run: echo "SHORT_SHA=$(echo $GITHUB_SHA | cut -c1-7)" >> $GITHUB_ENV
 
+      # Build and push Docker images
       - name: Build and push vote image
         run: |
           docker build -t $ECR_REPOSITORY/vote:$SHORT_SHA ./vote
@@ -56,6 +58,47 @@ jobs:
           docker tag $ECR_REPOSITORY/seed-data:$SHORT_SHA ${{ steps.login-ecr.outputs.registry }}/$ECR_REPOSITORY/seed-data:$SHORT_SHA
           docker push ${{ steps.login-ecr.outputs.registry }}/$ECR_REPOSITORY/seed-data:$SHORT_SHA
 
+      # Cleanup old ECR images
+      - name: Cleanup old ECR images
+        run: |
+          IMAGE_CATEGORIES=("vote" "result" "worker" "seed-data")
+          DAYS_TO_KEEP=7
+
+          for REPO_NAME in "${IMAGE_CATEGORIES[@]}"; do
+            echo "Cleaning up $ECR_REPOSITORY/$REPO_NAME"
+
+            # Delete untagged images
+            echo "Deleting untagged images..."
+            aws ecr batch-delete-image \
+              --repository-name "$ECR_REPOSITORY/$REPO_NAME" \
+              --image-ids "$(aws ecr list-images --repository-name "$ECR_REPOSITORY/$REPO_NAME" --filter "tagStatus=UNTAGGED" --query 'imageIds[*]' --output json)" || true
+
+            # Delete images older than the defined threshold
+            echo "Deleting images older than $DAYS_TO_KEEP days..."
+            aws ecr describe-images \
+              --repository-name "$ECR_REPOSITORY/$REPO_NAME" \
+              --query "sort_by(imageDetails, &imagePushedAt)[*].imageDigest" \
+              --output text | while read digest; do
+
+              PUSH_DATE=$(aws ecr describe-images \
+                --repository-name "$ECR_REPOSITORY/$REPO_NAME" \
+                --image-ids imageDigest="$digest" \
+                --query 'imageDetails[0].imagePushedAt' --output text)
+
+              PUSH_TIMESTAMP=$(date -d "$PUSH_DATE" +%s)
+              CURRENT_TIMESTAMP=$(date +%s)
+              DAYS_OLD=$(((CURRENT_TIMESTAMP - PUSH_TIMESTAMP) / 86400))
+
+              if (( DAYS_OLD > DAYS_TO_KEEP )); then
+                echo "Deleting $digest (pushed $DAYS_OLD days ago)"
+                aws ecr batch-delete-image \
+                  --repository-name "$ECR_REPOSITORY/$REPO_NAME" \
+                  --image-ids imageDigest="$digest" || true
+              fi
+            done
+          done
+
+      # Checkout deployment repo and update image tags
       - name: Checkout deployment repo
         uses: actions/checkout@v3
         with:
@@ -70,11 +113,11 @@ jobs:
           find deployment-repo -type f -name '*.yaml' -exec sed -i "s|image: .*/worker:.*|image: ${{ steps.login-ecr.outputs.registry }}/$ECR_REPOSITORY/worker:$SHORT_SHA|g" {} +
           find deployment-repo -type f -name '*.yaml' -exec sed -i "s|image: .*/seed-data:.*|image: ${{ steps.login-ecr.outputs.registry }}/$ECR_REPOSITORY/seed-data:$SHORT_SHA|g" {} +
 
-      - name: Commit and push changes to deployment repo
+      - name: Commit and push updated YAMLs
         run: |
           cd deployment-repo
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add .
           git commit -m "Update image tags to $SHORT_SHA [ci skip]" || echo "No changes to commit"
-          git push 
+          git push
