@@ -33,22 +33,18 @@ jobs:
       - name: Cleanup all old ECR images
         run: |
           IMAGE_CATEGORIES=("vote" "result" "worker" "seed-data")
-
           for REPO_NAME in "${IMAGE_CATEGORIES[@]}"; do
             FULL_REPO="$ECR_REPOSITORY/$REPO_NAME"
             echo "Cleaning $FULL_REPO..."
-
             IMAGE_DETAILS=$(aws ecr describe-images \
               --repository-name "$FULL_REPO" \
               --region "$AWS_REGION" \
               --query 'imageDetails[*].imageDigest' \
               --output text)
-
             if [[ -z "$IMAGE_DETAILS" ]]; then
               echo "No images to delete in $FULL_REPO."
               continue
             fi
-
             for DIGEST in $IMAGE_DETAILS; do
               echo "Deleting image digest: $DIGEST"
               aws ecr batch-delete-image \
@@ -62,28 +58,56 @@ jobs:
         id: vars
         run: echo "SHORT_SHA=$(echo $GITHUB_SHA | cut -c1-7)" >> $GITHUB_ENV
 
-      # 🔧 Build and Push Docker Images
-      - name: Build and push vote image
+      # Install Grype once
+      - name: Install Grype vulnerability scanner
         run: |
-          docker build -t $ECR_REPOSITORY/vote:$SHORT_SHA ./vote
+          curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sh -s -- -b /usr/local/bin
+
+      # Build, scan, push vote image
+      - name: Build vote image
+        run: docker build -t $ECR_REPOSITORY/vote:$SHORT_SHA ./vote
+
+      - name: Scan vote image for vulnerabilities
+        run: grype $ECR_REPOSITORY/vote:$SHORT_SHA --fail-on high
+
+      - name: Push vote image
+        run: |
           docker tag $ECR_REPOSITORY/vote:$SHORT_SHA ${{ steps.login-ecr.outputs.registry }}/$ECR_REPOSITORY/vote:$SHORT_SHA
           docker push ${{ steps.login-ecr.outputs.registry }}/$ECR_REPOSITORY/vote:$SHORT_SHA
 
-      - name: Build and push result image
+      # Build, scan, push result image
+      - name: Build result image
+        run: docker build -t $ECR_REPOSITORY/result:$SHORT_SHA ./result
+
+      - name: Scan result image for vulnerabilities
+        run: grype $ECR_REPOSITORY/result:$SHORT_SHA --fail-on high
+
+      - name: Push result image
         run: |
-          docker build -t $ECR_REPOSITORY/result:$SHORT_SHA ./result
           docker tag $ECR_REPOSITORY/result:$SHORT_SHA ${{ steps.login-ecr.outputs.registry }}/$ECR_REPOSITORY/result:$SHORT_SHA
           docker push ${{ steps.login-ecr.outputs.registry }}/$ECR_REPOSITORY/result:$SHORT_SHA
 
-      - name: Build and push worker image
+      # Build, scan, push worker image
+      - name: Build worker image
+        run: docker build -t $ECR_REPOSITORY/worker:$SHORT_SHA ./worker
+
+      - name: Scan worker image for vulnerabilities
+        run: grype $ECR_REPOSITORY/worker:$SHORT_SHA --fail-on high
+
+      - name: Push worker image
         run: |
-          docker build -t $ECR_REPOSITORY/worker:$SHORT_SHA ./worker
           docker tag $ECR_REPOSITORY/worker:$SHORT_SHA ${{ steps.login-ecr.outputs.registry }}/$ECR_REPOSITORY/worker:$SHORT_SHA
           docker push ${{ steps.login-ecr.outputs.registry }}/$ECR_REPOSITORY/worker:$SHORT_SHA
 
-      - name: Build and push seed-data image
+      # Build, scan, push seed-data image
+      - name: Build seed-data image
+        run: docker build -t $ECR_REPOSITORY/seed-data:$SHORT_SHA ./seed-data
+
+      - name: Scan seed-data image for vulnerabilities
+        run: grype $ECR_REPOSITORY/seed-data:$SHORT_SHA --fail-on high
+
+      - name: Push seed-data image
         run: |
-          docker build -t $ECR_REPOSITORY/seed-data:$SHORT_SHA ./seed-data
           docker tag $ECR_REPOSITORY/seed-data:$SHORT_SHA ${{ steps.login-ecr.outputs.registry }}/$ECR_REPOSITORY/seed-data:$SHORT_SHA
           docker push ${{ steps.login-ecr.outputs.registry }}/$ECR_REPOSITORY/seed-data:$SHORT_SHA
 
@@ -110,4 +134,3 @@ jobs:
           git add .
           git commit -m "Update image tags to $SHORT_SHA [ci skip]" || echo "No changes to commit"
           git push
-
