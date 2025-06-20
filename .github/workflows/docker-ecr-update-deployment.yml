@@ -29,11 +29,40 @@ jobs:
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
+      # 🧹 Delete all existing images BEFORE pushing new ones
+      - name: Cleanup all old ECR images
+        run: |
+          IMAGE_CATEGORIES=("vote" "result" "worker" "seed-data")
+
+          for REPO_NAME in "${IMAGE_CATEGORIES[@]}"; do
+            FULL_REPO="$ECR_REPOSITORY/$REPO_NAME"
+            echo "Cleaning $FULL_REPO..."
+
+            IMAGE_DETAILS=$(aws ecr describe-images \
+              --repository-name "$FULL_REPO" \
+              --region "$AWS_REGION" \
+              --query 'imageDetails[*].imageDigest' \
+              --output text)
+
+            if [[ -z "$IMAGE_DETAILS" ]]; then
+              echo "No images to delete in $FULL_REPO."
+              continue
+            fi
+
+            for DIGEST in $IMAGE_DETAILS; do
+              echo "Deleting image digest: $DIGEST"
+              aws ecr batch-delete-image \
+                --repository-name "$FULL_REPO" \
+                --region "$AWS_REGION" \
+                --image-ids imageDigest="$DIGEST" || true
+            done
+          done
+
       - name: Extract short SHA
         id: vars
         run: echo "SHORT_SHA=$(echo $GITHUB_SHA | cut -c1-7)" >> $GITHUB_ENV
 
-      # Build and push Docker images
+      # 🔧 Build and Push Docker Images
       - name: Build and push vote image
         run: |
           docker build -t $ECR_REPOSITORY/vote:$SHORT_SHA ./vote
@@ -58,46 +87,7 @@ jobs:
           docker tag $ECR_REPOSITORY/seed-data:$SHORT_SHA ${{ steps.login-ecr.outputs.registry }}/$ECR_REPOSITORY/seed-data:$SHORT_SHA
           docker push ${{ steps.login-ecr.outputs.registry }}/$ECR_REPOSITORY/seed-data:$SHORT_SHA
 
-      # Cleanup ECR images — keep only the latest
-      - name: Cleanup old ECR images (keep only latest)
-        run: |
-          IMAGE_CATEGORIES=("vote" "result" "worker" "seed-data")
-
-          for REPO_NAME in "${IMAGE_CATEGORIES[@]}"; do
-            FULL_REPO="$ECR_REPOSITORY/$REPO_NAME"
-            echo "Processing $FULL_REPO..."
-
-            # Get all images sorted by push date
-            IMAGE_DETAILS=$(aws ecr describe-images \
-              --repository-name "$FULL_REPO" \
-              --region "$AWS_REGION" \
-              --query 'sort_by(imageDetails, &imagePushedAt)[*]' \
-              --output json)
-
-            COUNT=$(echo "$IMAGE_DETAILS" | jq length)
-            echo "Found $COUNT image(s) in $FULL_REPO"
-
-            if (( COUNT <= 1 )); then
-              echo "Skipping $FULL_REPO — only 1 image exists."
-              continue
-            fi
-
-            for (( i=0; i<COUNT-1; i++ )); do
-              DIGEST=$(echo "$IMAGE_DETAILS" | jq -r ".[$i].imageDigest")
-              if [[ "$DIGEST" != "null" && -n "$DIGEST" ]]; then
-                echo "Deleting old image digest: $DIGEST"
-                aws ecr batch-delete-image \
-                  --repository-name "$FULL_REPO" \
-                  --region "$AWS_REGION" \
-                  --image-ids imageDigest="$DIGEST" || true
-              fi
-            done
-
-            echo "✔ Cleaned $FULL_REPO"
-            echo "-----------------------------"
-          done
-
-      # Checkout deployment repo and update image tags
+      # ✅ Update YAMLs in Deployment Repo
       - name: Checkout deployment repo
         uses: actions/checkout@v3
         with:
@@ -120,3 +110,4 @@ jobs:
           git add .
           git commit -m "Update image tags to $SHORT_SHA [ci skip]" || echo "No changes to commit"
           git push
+
